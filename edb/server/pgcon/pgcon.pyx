@@ -814,6 +814,7 @@ cdef class PGConnection:
         bytes state,
         int dbver,
         bint use_pending_func_cache,
+        tx_isolation,
     ):
         cdef:
             WriteBuffer out
@@ -846,9 +847,10 @@ cdef class PGConnection:
         if state is not None:
             self._build_apply_state_req(state, out)
             if (
-                query.tx_id or
-                not query.is_transactional or
-                query.append_rollback
+                query.tx_id
+                or not query.is_transactional
+                or query.append_rollback
+                or tx_isolation is not None
             ):
                 # This query has START TRANSACTION or non-transactional command
                 # like CREATE DATABASE in it.
@@ -859,13 +861,18 @@ cdef class PGConnection:
                 state_sync = 1
                 self.write_sync(out)
 
-        if query.append_rollback:
+        if query.append_rollback or tx_isolation is not None:
             if self.in_tx():
                 sp_name = f'_edb_{time.monotonic_ns()}'
                 sql = f'SAVEPOINT {sp_name}'.encode('utf-8')
             else:
                 sp_name = None
                 sql = b'START TRANSACTION'
+                if tx_isolation is not None:
+                    sql += (
+                        f' ISOLATION LEVEL {tx_isolation._value_}'
+                        .encode('utf-8')
+                    )
 
             buf = WriteBuffer.new_message(b'P')
             buf.write_bytestring(b'')
@@ -956,11 +963,14 @@ cdef class PGConnection:
             buf.write_int32(0)  # limit: 0 - return all rows
             out.write_buffer(buf.end_message())
 
-        if query.append_rollback:
-            if sp_name:
-                sql = f'ROLLBACK TO SAVEPOINT {sp_name}'.encode('utf-8')
+        if query.append_rollback or tx_isolation is not None:
+            if query.append_rollback:
+                if sp_name:
+                    sql = f'ROLLBACK TO SAVEPOINT {sp_name}'.encode('utf-8')
+                else:
+                    sql = b'ROLLBACK'
             else:
-                sql = b'ROLLBACK'
+                sql = b'COMMIT'
 
             buf = WriteBuffer.new_message(b'P')
             buf.write_bytestring(b'')
@@ -990,7 +1000,7 @@ cdef class PGConnection:
             if state is not None:
                 await self.wait_for_state_resp(state, state_sync)
 
-            if query.append_rollback:
+            if query.append_rollback or tx_isolation is not None:
                 await self.wait_for_sync()
 
             buf = None
@@ -1095,6 +1105,7 @@ cdef class PGConnection:
         bytes state = None,
         int dbver = 0,
         bint use_pending_func_cache = 0,
+        tx_isolation = None,
     ):
         self.before_command()
         started_at = time.monotonic()
@@ -1107,6 +1118,7 @@ cdef class PGConnection:
                 state,
                 dbver,
                 use_pending_func_cache,
+                tx_isolation,
             )
         finally:
             metrics.backend_query_duration.observe(
@@ -1782,23 +1794,19 @@ cdef class PGConnection:
                     # include the internal params for globals.
                     # This chunk of code remaps the descriptions of internal
                     # params into external ones.
-                    count_internal = self.buffer.read_int16()
+                    self.buffer.read_int16()  # count_internal
                     data_internal = self.buffer.consume_message()
 
                     msg_buf = WriteBuffer.new_message(b't')
-                    external_params = []
+                    external_params: int64_t = 0
                     if action.query_unit.params:
-                        for i_int, param in enumerate(action.query_unit.params):
-                            if isinstance(param, dbstate.SQLParamExternal):
-                                i_ext = param.index - 1
-                                external_params.append((i_ext, i_int))
+                        for index, param in enumerate(action.query_unit.params):
+                            if not isinstance(param, dbstate.SQLParamExternal):
+                                break
+                            external_params = index + 1
 
-                    msg_buf.write_int16(len(external_params))
-
-                    external_params.sort()
-                    for _, i_int in external_params:
-                        oid = data_internal[i_int * 4:(i_int + 1) * 4]
-                        msg_buf.write_bytes(oid)
+                    msg_buf.write_int16(external_params)
+                    msg_buf.write_bytes(data_internal[0:external_params * 4])
 
                     buf.write_buffer(msg_buf.end_message())
 
@@ -2834,6 +2842,8 @@ cdef set NON_QUOTABLE_STRINGS = {
     'on',
     'yes',
     'no',
+    'true',
+    'false',
 }
 
 

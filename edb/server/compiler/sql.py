@@ -45,6 +45,7 @@ FE_SETTINGS_MUTABLE: immutables.Map[str, bool] = immutables.Map(
     {
         'search_path': True,
         'allow_user_specified_id': True,
+        'apply_access_policies_sql': True,
         'server_version': False,
         'server_version_num': False,
     }
@@ -59,11 +60,15 @@ def compile_sql(
     prepared_stmt_map: Mapping[str, str],
     current_database: str,
     current_user: str,
+    allow_user_specified_id: Optional[bool],
+    apply_access_policies_sql: Optional[bool],
 ) -> List[dbstate.SQLQueryUnit]:
     opts = ResolverOptionsPartial(
         query_str=query_str,
         current_database=current_database,
         current_user=current_user,
+        allow_user_specified_id=allow_user_specified_id,
+        apply_access_policies_sql=apply_access_policies_sql,
     )
 
     stmts = pg_parser.parse(query_str, propagate_spans=True)
@@ -267,6 +272,8 @@ class ResolverOptionsPartial:
     current_user: str
     current_database: str
     query_str: str
+    allow_user_specified_id: Optional[bool]
+    apply_access_policies_sql: Optional[bool]
 
 
 def resolve_query(
@@ -278,24 +285,27 @@ def resolve_query(
     from edb.pgsql import resolver as pg_resolver
 
     search_path: Sequence[str] = ("public",)
-    allow_user_specified_id: bool = False
-
     try:
         setting = tx_state.get("search_path")
     except KeyError:
         setting = None
     search_path = parse_search_path(setting)
 
-    try:
-        setting = tx_state.get("allow_user_specified_id")
-    except KeyError:
-        setting = None
-    if setting:
-        if isinstance(setting[0], str):
-            truthy = {'on', 'true', 'yes', '1'}
-            allow_user_specified_id = setting[0].lower() in truthy
-        elif isinstance(setting[0], int):
-            allow_user_specified_id = bool(setting[0])
+    allow_user_specified_id = lookup_bool_setting(
+        tx_state, 'allow_user_specified_id'
+    )
+    if allow_user_specified_id is None:
+        allow_user_specified_id = opts.allow_user_specified_id
+    if allow_user_specified_id is None:
+        allow_user_specified_id = False
+
+    apply_access_policies = lookup_bool_setting(
+        tx_state, 'apply_access_policies_sql'
+    )
+    if apply_access_policies is None:
+        apply_access_policies = opts.apply_access_policies_sql
+    if apply_access_policies is None:
+        apply_access_policies = False
 
     options = pg_resolver.Options(
         current_user=opts.current_user,
@@ -303,10 +313,33 @@ def resolve_query(
         current_query=opts.query_str,
         search_path=search_path,
         allow_user_specified_id=allow_user_specified_id,
+        apply_access_policies=apply_access_policies,
     )
     resolved = pg_resolver.resolve(stmt, schema, options)
     source = pg_codegen.generate(resolved.ast, with_translation_data=True)
     return resolved, source
+
+
+def lookup_bool_setting(
+    tx_state: dbstate.SQLTransactionState, name: str
+) -> Optional[bool]:
+    try:
+        setting = tx_state.get(name)
+    except KeyError:
+        setting = None
+    if setting and setting[0]:
+        return is_setting_truthy(setting[0])
+    return None
+
+
+def is_setting_truthy(val: str | int | float) -> bool:
+    if isinstance(val, str):
+        truthy = {'on', 'true', 'yes', '1'}
+        return val.lower() in truthy
+    elif isinstance(val, int):
+        return bool(val)
+    else:
+        return False
 
 
 def compute_stmt_name(text: str, tx_state: dbstate.SQLTransactionState) -> str:

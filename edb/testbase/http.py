@@ -30,6 +30,7 @@ import json
 import threading
 import urllib.parse
 import urllib.request
+import dataclasses
 
 import edgedb
 
@@ -43,17 +44,7 @@ from . import server
 bag = assert_data_shape.bag
 
 
-class BaseHttpExtensionTest(server.QueryTestCase):
-    @classmethod
-    def get_extension_path(cls):
-        raise NotImplementedError
-
-    @classmethod
-    def get_api_prefix(cls):
-        extpath = cls.get_extension_path()
-        dbname = cls.get_database_name()
-        return f'/branch/{dbname}/{extpath}'
-
+class BaseHttpTest(server.QueryTestCase):
     @classmethod
     async def _wait_for_db_config(
         cls, config_key, *, server=None, instance_config=False, value=None
@@ -61,7 +52,10 @@ class BaseHttpExtensionTest(server.QueryTestCase):
         dbname = cls.get_database_name()
         # Wait for the database config changes to propagate to the
         # server by watching a debug endpoint
-        async for tr in cls.try_until_succeeds(ignore=AssertionError):
+        async for tr in cls.try_until_succeeds(
+            ignore=AssertionError,
+            timeout=120,
+        ):
             async with tr:
                 with cls.http_con(server) as http_con:
                     (
@@ -85,6 +79,18 @@ class BaseHttpExtensionTest(server.QueryTestCase):
                         raise AssertionError('database config not ready')
                     if value and config[config_key] != value:
                         raise AssertionError(f'database config not ready')
+
+
+class BaseHttpExtensionTest(BaseHttpTest):
+    @classmethod
+    def get_extension_path(cls):
+        raise NotImplementedError
+
+    @classmethod
+    def get_api_prefix(cls):
+        extpath = cls.get_extension_path()
+        dbname = cls.get_database_name()
+        return f'/branch/{dbname}/{extpath}'
 
 
 class ExtAuthTestCase(BaseHttpExtensionTest):
@@ -332,6 +338,13 @@ class MultiHostMockHttpServerHandler(MockHttpServerHandler):
 ResponseType = tuple[str, int] | tuple[str, int, dict[str, str]]
 
 
+@dataclasses.dataclass
+class RequestDetails:
+    headers: dict[str, str | Any]
+    query_params: dict[str, list[str]]
+    body: Optional[str]
+
+
 class MockHttpServer:
     def __init__(
         self,
@@ -343,11 +356,11 @@ class MockHttpServer:
             (
                 ResponseType
                 | Callable[
-                    [MockHttpServerHandler, dict[str, Any]], ResponseType
+                    [MockHttpServerHandler, RequestDetails], ResponseType
                 ]
             ),
         ] = {}
-        self.requests: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        self.requests: dict[tuple[str, str, str], list[RequestDetails]] = {}
         self.url: Optional[str] = None
         self.handler_type = handler_type
 
@@ -366,7 +379,7 @@ class MockHttpServer:
             handler: (
                 ResponseType
                 | Callable[
-                    [MockHttpServerHandler, dict[str, Any]], ResponseType
+                    [MockHttpServerHandler, RequestDetails], ResponseType
                 ]
             )
         ):
@@ -397,11 +410,11 @@ class MockHttpServer:
         else:
             body = None
 
-        request_details = {
-            'headers': headers,
-            'query_params': query_params,
-            'body': body,
-        }
+        request_details = RequestDetails(
+            headers=headers,
+            query_params=query_params,
+            body=body,
+        )
         self.requests[key].append(request_details)
 
         if key not in self.routes:
@@ -428,14 +441,9 @@ class MockHttpServer:
             elif len(registered_handler) == 3:
                 response, status, additional_headers = registered_handler
 
-        if "headers" in request_details and isinstance(
-            request_details["headers"], dict
-        ):
-            accept_header = request_details["headers"].get(
-                "accept", "application/json"
-            )
-        else:
-            accept_header = "application/json"
+        accept_header = request_details.headers.get(
+            "accept", "application/json"
+        )
 
         if (
             accept_header.startswith("application/json")

@@ -47,7 +47,7 @@ EDGEDBGUI_COMMIT = 'main'
 
 PGVECTOR_REPO = 'https://github.com/pgvector/pgvector.git'
 # This can be a branch, tag, or commit
-PGVECTOR_COMMIT = 'v0.6.0'
+PGVECTOR_COMMIT = 'v0.7.4'
 
 SAFE_EXT_CFLAGS: list[str] = []
 if flag := os.environ.get('EDGEDB_OPT_CFLAG'):
@@ -1137,6 +1137,12 @@ setuptools.setup(
         setuptools_rust.RustExtension(
             "edb.server._pg_rust",
             path="edb/server/pgrust/Cargo.toml",
+            features=["python_extension"],
+            binding=setuptools_rust.Binding.PyO3,
+        ),
+        setuptools_rust.RustExtension(
+            "edb.server._http",
+            path="edb/server/http/Cargo.toml",
             features=["python_extension"],
             binding=setuptools_rust.Binding.PyO3,
         ),

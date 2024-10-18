@@ -356,10 +356,7 @@ def _uncompile_insert_object_stmt(
         value_columns.append((ptr_name, is_link))
 
         # inject type annotation into value relation
-        if is_link or ptr_name == 'id':
-            _try_inject_type_cast(
-                value_relation, index, pgast.TypeName(name=('uuid',))
-            )
+        _try_inject_ptr_type_cast(value_relation, index, ptr, ctx)
 
         # prepare the outputs of the source CTE
         ptr_id = _get_ptr_id(value_id, ptr, ctx)
@@ -681,6 +678,7 @@ def _uncompile_insert_pointer_stmt(
     )
     value_columns: List[Tuple[str, bool]] = []
     for index, expected_col in enumerate(expected_columns):
+        ptr: Optional[s_pointers.Pointer] = None
         if expected_col.name == 'source':
             ptr_name = 'source'
             is_link = True
@@ -688,6 +686,7 @@ def _uncompile_insert_pointer_stmt(
         elif expected_col.name == 'target':
             ptr_name = 'target'
             is_link = isinstance(sub, s_links.Link)
+            ptr = sub
             ptr_id = target_id
         else:
             # link pointer
@@ -710,6 +709,9 @@ def _uncompile_insert_pointer_stmt(
             _try_inject_type_cast(
                 value_relation, index, pgast.TypeName(name=('uuid',))
             )
+        else:
+            assert ptr
+            _try_inject_ptr_type_cast(value_relation, index, ptr, ctx)
 
         value_columns.append((ptr_name, is_link))
 
@@ -727,7 +729,8 @@ def _uncompile_insert_pointer_stmt(
     sub_name = sub.get_shortname(ctx.schema)
 
     target_ql: qlast.Expr = qlast.Path(
-        steps=[value_ql, qlast.Ptr(name='__target__')])
+        steps=[value_ql, qlast.Ptr(name='__target__')]
+    )
 
     if isinstance(sub_target, s_objtypes.ObjectType):
         assert isinstance(target_ql, qlast.Path)
@@ -1424,10 +1427,7 @@ def _uncompile_update_object_stmt(
             value_columns.append((ptr_name, is_link))
 
         # inject type annotation into value relation
-        if is_link:
-            _try_inject_type_cast(
-                value_relation, index + 1, pgast.TypeName(name=('uuid',))
-            )
+        _try_inject_ptr_type_cast(value_relation, index + 1, ptr, ctx)
 
         # prepare the outputs of the source CTE
         ptr_id = _get_ptr_id(value_id, ptr, ctx)
@@ -1619,6 +1619,7 @@ def _compile_uncompiled_dml(
             singletons=singletons,
             anchors=anchors,
             allow_user_specified_id=ctx.options.allow_user_specified_id,
+            apply_user_access_policies=ctx.options.apply_access_policies
         )
         ir_stmt = qlcompiler.compile_ast_to_ir(
             ql_stmt,
@@ -2014,6 +2015,21 @@ def _get_ptr_id(
     return source_id.extend(ptrref=ptrref)
 
 
+def _try_inject_ptr_type_cast(
+    rel: pgast.BaseRelation, index: int, ptr: s_pointers.Pointer, ctx: Context
+):
+    ptr_name = ptr.get_shortname(ctx.schema).name
+
+    tgt_pg: Tuple[str, ...]
+    if ptr_name == 'id' or isinstance(ptr, s_links.Link):
+        tgt_pg = ('uuid',)
+    else:
+        tgt = ptr.get_target(ctx.schema)
+        assert tgt
+        tgt_pg = pgtypes.pg_type_from_object(ctx.schema, tgt)
+    _try_inject_type_cast(rel, index, pgast.TypeName(name=tgt_pg))
+
+
 def _try_inject_type_cast(
     rel: pgast.BaseRelation,
     pos: int,
@@ -2022,7 +2038,16 @@ def _try_inject_type_cast(
     """
     If a relation is simple, injects type annotation for a column.
     This is needed for Postgres to correctly infer the type so it will be able
-    to bind to correct paramater types.
+    to bind to correct paramater types. For example:
+
+    INSERT x (a, b) VALUES ($1, $2)
+
+    is compiled into something like:
+
+    WITH cte AS (VALUES ($1, $2))
+    INSERT x (a, b) SELECT * FROM cte
+
+    This function adds type casts into `cte`.
     """
 
     if not isinstance(rel, pgast.SelectStmt):
@@ -2058,7 +2083,7 @@ def merge_params(
                 i
                 for i, p in enumerate(ctx.query_params)
                 if isinstance(p, dbstate.SQLParamGlobal)
-                and p.global_name == glob.name
+                and p.global_name == glob.global_name
             ),
             None,
         )
@@ -2093,3 +2118,20 @@ class ParamMapper(ast.NodeVisitor):
 
     def visit_Param(self, p: pgast.Param) -> None:
         p.index = self.mapping[p.index]
+
+
+def init_external_params(query: pgast.Base, ctx: Context):
+    counter = ParamCounter()
+    counter.node_visit(query)
+    for _ in range(counter.param_count):
+        ctx.query_params.append(dbstate.SQLParamExternal())
+
+
+class ParamCounter(ast.NodeVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.param_count = 0
+
+    def visit_ParamRef(self, p: pgast.ParamRef) -> None:
+        if self.param_count < p.number:
+            self.param_count = p.number

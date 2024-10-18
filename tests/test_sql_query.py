@@ -19,6 +19,7 @@
 import csv
 import io
 import os.path
+from typing import Optional
 import unittest
 import uuid
 
@@ -38,6 +39,8 @@ class TestSQLQuery(tb.SQLQueryTestCase):
     SCHEMA_INVENTORY = os.path.join(
         os.path.dirname(__file__), 'schemas', 'inventory.esdl'
     )
+
+    TRANSACTION_ISOLATION = False  # needed for test_sql_query_set_04
 
     SETUP = [
         '''
@@ -588,7 +591,7 @@ class TestSQLQuery(tb.SQLQueryTestCase):
             SELECT tableoid, xmin, cmin, xmax, cmax, ctid FROM ONLY "Content"
             '''
         )
-        # this numbers change, so let's just check that there are 6 of them
+        # these numbers change, so let's just check that there are 6 of them
         self.assertEqual(len(res[0]), 6)
 
         res = await self.squery_values(
@@ -604,6 +607,39 @@ class TestSQLQuery(tb.SQLQueryTestCase):
             '''
         )
         self.assertEqual(len(res[0]), 6)
+
+    async def test_sql_query_33a(self):
+        # system columns when access policies are applied
+        tran = self.scon.transaction()
+        await tran.start()
+        await self.scon.execute('SET LOCAL apply_access_policies_sql TO true')
+        await self.scon.execute(
+            """SET LOCAL "global default::filter_title" TO 'Halo 3'"""
+        )
+
+        res = await self.squery_values(
+            '''
+            SELECT tableoid, xmin, cmin, xmax, cmax, ctid FROM ONLY "Content"
+            '''
+        )
+        # these numbers change, so let's just check that there are 6 of them
+        self.assertEqual(len(res[0]), 6)
+
+        res = await self.squery_values(
+            '''
+            SELECT tableoid, xmin, cmin, xmax, cmax, ctid FROM "Content"
+            '''
+        )
+        self.assertEqual(len(res[0]), 6)
+
+        res = await self.squery_values(
+            '''
+            SELECT tableoid, xmin, cmin, xmax, cmax, ctid FROM "Movie.actors"
+            '''
+        )
+        self.assertEqual(len(res[0]), 6)
+
+        await tran.rollback()
 
     async def test_sql_query_34(self):
         # GROUP and ORDER BY aliased column
@@ -735,6 +771,26 @@ class TestSQLQuery(tb.SQLQueryTestCase):
         res = await self.squery_values("SELECT x'00abcdef00';")
         self.assertEqual(res, [[b'\x00\xab\xcd\xef\x00']])
 
+    async def test_sql_query_42(self):
+        # params out of order
+
+        res = await self.squery_values(
+            'SELECT $2::int, $3::bool, $1::text', 'hello', 42, True,
+        )
+        self.assertEqual(res, [[42, True, 'hello']])
+
+        tran = self.scon.transaction()
+        await tran.start()
+        res = await self.scon.execute(
+            '''
+            UPDATE "Book" SET pages = $1 WHERE (title = $2)
+            ''',
+            207,
+            'Chronicles of Narnia',
+        )
+        self.assertEqual(res, 'UPDATE 1')
+        await tran.rollback()
+
     async def test_sql_query_introspection_00(self):
         dbname = self.con.dbname
         res = await self.squery_values(
@@ -751,6 +807,7 @@ class TestSQLQuery(tb.SQLQueryTestCase):
                 ['public', 'Book'],
                 ['public', 'Book.chapters'],
                 ['public', 'Content'],
+                ['public', 'ContentSummary'],
                 ['public', 'Genre'],
                 ['public', 'Movie'],
                 ['public', 'Movie.actors'],
@@ -787,6 +844,9 @@ class TestSQLQuery(tb.SQLQueryTestCase):
                 ['Content', '__type__', 'NO', 2],
                 ['Content', 'genre_id', 'YES', 3],
                 ['Content', 'title', 'NO', 4],
+                ['ContentSummary', 'id', 'NO', 1],
+                ['ContentSummary', '__type__', 'NO', 2],
+                ['ContentSummary', 'x', 'NO', 3],
                 ['Genre', 'id', 'NO', 1],
                 ['Genre', '__type__', 'NO', 2],
                 ['Genre', 'name', 'NO', 3],
@@ -836,14 +896,12 @@ class TestSQLQuery(tb.SQLQueryTestCase):
             GROUP BY tbl_name
             '''
         )
-        for [table_name, columns_from_information_schema] in tables:
-            if table_name.split('.')[0] in ('cfg', 'schema', 'sys'):
+        for [tbl_name, columns_from_information_schema] in tables:
+            if tbl_name.split('.')[0] in ('cfg', 'schema', 'sys', '"ext::ai"'):
                 continue
 
             try:
-                prepared = await self.scon.prepare(
-                    f'SELECT * FROM {table_name}'
-                )
+                prepared = await self.scon.prepare(f'SELECT * FROM {tbl_name}')
 
                 attributes = prepared.get_attributes()
                 columns_from_resolver = [a.name for a in attributes]
@@ -853,7 +911,7 @@ class TestSQLQuery(tb.SQLQueryTestCase):
                     columns_from_information_schema,
                 )
             except Exception:
-                raise Exception(f'introspecting {table_name}')
+                raise Exception(f'introspecting {tbl_name}')
 
     async def test_sql_query_introspection_03(self):
         res = await self.squery_values(
@@ -1014,6 +1072,78 @@ class TestSQLQuery(tb.SQLQueryTestCase):
         res = await self.squery_values('SHOW search_path;')
         self.assertEqual(res, [["public"]])
 
+    async def test_sql_query_set_04(self):
+        # database settings allow_user_specified_ids & apply_access_policies_sql
+        # should be unified over EdgeQL and SQL adapter
+
+        async def set_current_database(val: Optional[bool]):
+            if val is None:
+                await self.con.execute(
+                    f'''
+                    configure current database
+                        reset apply_access_policies_sql;
+                    '''
+                )
+            else:
+                await self.con.execute(
+                    f'''
+                    configure current database
+                        set apply_access_policies_sql := {str(val).lower()};
+                    '''
+                )
+
+        async def set_sql(val: Optional[bool]):
+            if val is None:
+                await self.scon.execute(
+                    f'''
+                    RESET apply_access_policies_sql;
+                    '''
+                )
+            else:
+                await self.scon.execute(
+                    f'''
+                    SET apply_access_policies_sql TO '{str(val).lower()}';
+                    '''
+                )
+
+        async def are_policies_applied() -> bool:
+            res = await self.squery_values(
+                'SELECT title FROM "Content" ORDER BY title'
+            )
+            return len(res) == 0
+
+        await set_current_database(True)
+        await set_sql(True)
+        self.assertEqual(await are_policies_applied(), True)
+
+        await set_sql(False)
+        self.assertEqual(await are_policies_applied(), False)
+
+        await set_sql(None)
+        self.assertEqual(await are_policies_applied(), True)
+
+        await set_current_database(False)
+        await set_sql(True)
+        self.assertEqual(await are_policies_applied(), True)
+
+        await set_sql(False)
+        self.assertEqual(await are_policies_applied(), False)
+
+        await set_sql(None)
+        self.assertEqual(await are_policies_applied(), False)
+
+        await set_current_database(None)
+        await set_sql(True)
+        self.assertEqual(await are_policies_applied(), True)
+
+        await set_sql(False)
+        self.assertEqual(await are_policies_applied(), False)
+
+        await set_sql(None)
+        self.assertEqual(await are_policies_applied(), False)
+
+        # setting cleanup not needed, since with end with the None, None
+
     async def test_sql_query_static_eval_01(self):
         res = await self.squery_values('select current_schema;')
         self.assertEqual(res, [['public']])
@@ -1108,6 +1238,7 @@ class TestSQLQuery(tb.SQLQueryTestCase):
                 ["Book", 8192],
                 ["Book.chapters", 8192],
                 ["Content", 8192],
+                ["ContentSummary", 8192],
                 ["Genre", 8192],
                 ["Movie", 8192],
                 ["Movie.actors", 8192],
@@ -1686,5 +1817,127 @@ class TestSQLQuery(tb.SQLQueryTestCase):
                 ]
             ],
         )
+
+        await tran.rollback()
+
+    async def test_sql_query_access_policy_01(self):
+        tran = self.scon.transaction()
+        await tran.start()
+
+        # no access policies
+        res = await self.squery_values(
+            'SELECT title FROM "Content" ORDER BY title'
+        )
+        self.assertEqual(
+            res,
+            [
+                ['Chronicles of Narnia'],
+                ['Forrest Gump'],
+                ['Halo 3'],
+                ['Hunger Games'],
+                ['Saving Private Ryan'],
+            ],
+        )
+
+        await self.scon.execute('SET LOCAL apply_access_policies_sql TO true')
+
+        # access policies applied
+        res = await self.squery_values(
+            'SELECT title FROM "Content" ORDER BY title'
+        )
+        self.assertEqual(res, [])
+
+        # access policies use globals
+        await self.scon.execute(
+            """SET LOCAL "global default::filter_title" TO 'Forrest Gump'"""
+        )
+        res = await self.squery_values(
+            'SELECT title FROM "Content" ORDER BY title'
+        )
+        self.assertEqual(res, [['Forrest Gump']])
+
+        await tran.rollback()
+
+    async def test_sql_query_access_policy_02(self):
+        # access policies from computeds
+
+        tran = self.scon.transaction()
+        await tran.start()
+
+        await self.scon.execute('INSERT INTO "ContentSummary" DEFAULT VALUES')
+
+        # no access policies
+        res = await self.squery_values('SELECT x FROM "ContentSummary"')
+        self.assertEqual(res, [[5]])
+
+        await self.scon.execute('SET LOCAL apply_access_policies_sql TO true')
+
+        # access policies applied
+        res = await self.squery_values('SELECT x FROM "ContentSummary"')
+        self.assertEqual(res, [[0]])
+
+        # access policies use globals
+        await self.scon.execute(
+            """SET LOCAL "global default::filter_title" TO 'Forrest Gump'"""
+        )
+        res = await self.squery_values('SELECT x FROM "ContentSummary"')
+        self.assertEqual(res, [[1]])
+
+        await tran.rollback()
+
+    async def test_sql_query_access_policy_03(self):
+        # access policies for dml
+
+        tran = self.scon.transaction()
+        await tran.start()
+
+        # allowed without applying access policies
+        await self.scon.execute('INSERT INTO "ContentSummary" DEFAULT VALUES')
+
+        await self.scon.execute('SET LOCAL apply_access_policies_sql TO true')
+
+        # allowed when filter_title == 'summary'
+        await self.scon.execute(
+            """SET LOCAL "global default::filter_title" TO 'summary'"""
+        )
+        await self.scon.execute('INSERT INTO "ContentSummary" DEFAULT VALUES')
+
+        # not allowed when filter_title is something else
+        await self.scon.execute(
+            """SET LOCAL "global default::filter_title" TO 'something else'"""
+        )
+        with self.assertRaisesRegex(
+            asyncpg.exceptions.InsufficientPrivilegeError,
+            'access policy violation on insert of default::ContentSummary',
+        ):
+            await self.scon.execute(
+                'INSERT INTO "ContentSummary" DEFAULT VALUES'
+            )
+
+        await tran.rollback()
+
+    async def test_sql_query_access_policy_04(self):
+        # access policies without inheritance
+
+        tran = self.scon.transaction()
+        await tran.start()
+
+        # there is only one object that is of exactly type Content
+        res = await self.squery_values('SELECT * FROM ONLY "Content"')
+        self.assertEqual(len(res), 1)
+
+        await self.scon.execute('SET LOCAL apply_access_policies_sql TO true')
+
+        await self.scon.execute(
+            """SET LOCAL "global default::filter_title" TO 'Halo 3'"""
+        )
+        res = await self.squery_values('SELECT * FROM ONLY "Content"')
+        self.assertEqual(len(res), 1)
+
+        await self.scon.execute(
+            """SET LOCAL "global default::filter_title" TO 'Forrest Gump'"""
+        )
+        res = await self.squery_values('SELECT * FROM ONLY "Content"')
+        self.assertEqual(len(res), 0)
 
         await tran.rollback()
